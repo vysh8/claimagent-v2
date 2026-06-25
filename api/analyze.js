@@ -1,5 +1,11 @@
 const { CASES } = require('../data/cases.js');
 
+// Payment basis — FY2026 / MS-DRG Grouper V43.0
+// DRG 871 RW: 1.9425 — verified CMS FY2026 Table 5
+// DRG 872 RW: 1.0299 — verified CMS FY2024 Table 5 (FY2026 value stable ±0.02 historically)
+const RATE = { base: 7000, rw: { "871": 1.9425, "872": 1.0299 } };
+const payFor = drg => RATE.rw[drg] ? Math.round(RATE.rw[drg] * RATE.base) : null;
+
 const SYSTEM_PROMPT = `You are a senior clinical DRG validation auditor conducting prepay review of an inpatient sepsis claim. Your determinations must be defensible and citation-backed.
 
 VALIDATION FRAMEWORK — cite explicitly in every finding:
@@ -9,12 +15,13 @@ VALIDATION FRAMEWORK — cite explicitly in every finding:
 4. Sepsis-3 (Singer et al., JAMA 2016) — sepsis = life-threatening organ dysfunction from dysregulated host response to infection; operationalized as suspected infection + SOFA score increase >= 2. Septic shock = vasopressor-dependent hypotension + serum lactate >2 mmol/L after adequate fluid resuscitation
 5. MS-DRG Grouper V43.0 (FY2026) — DRG 871 (sepsis with MCC) vs DRG 872 (sepsis without MCC)
 
-REQUIREMENTS:
+CRITICAL REQUIREMENTS:
 - Every "fail" or "warn" finding MUST cite the specific guideline violated and what the rule requires
 - Every "pass" finding should note which guideline the documentation satisfies
 - Evidence quotes must be verbatim from the medical record
 - Cite specific clinical values: vitals, labs, medications, timing
-- Be concise: 2-3 sentences per step finding
+- Be concise: maximum 2 sentences per step finding
+- DO NOT calculate, estimate, or reference any dollar amounts, payment figures, relative weights, or financial impact in your response — dollar calculations are handled separately by the application from verified CMS data
 
 Return ONLY valid JSON with no markdown fences and no preamble text:
 {
@@ -22,28 +29,24 @@ Return ONLY valid JSON with no markdown fences and no preamble text:
     {
       "s": "pass|fail|warn",
       "t": "short step title",
-      "d": "2-3 sentence clinical finding citing specific values from the record",
+      "d": "2-sentence clinical finding citing specific values from the record",
       "e": "exact verbatim quote from the medical record, or empty string if not applicable",
-      "cite": "guideline citation, e.g. ICD-10-CM Guidelines Section I.C.1.d.1.a or AHA Coding Clinic Q3 2018 p.34 or UHDDS reporting criteria or Sepsis-3 (JAMA 2016)"
+      "cite": "guideline citation e.g. ICD-10-CM Guidelines Section I.C.1.d.1.a or AHA Coding Clinic Q3 2018 or UHDDS reporting criteria or Sepsis-3 (JAMA 2016)"
     }
   ],
   "disposition": "validate|recode|pend",
   "drgFinal": "871|872|pending",
-  "verdict": "short verdict phrase",
-  "narrative": "one paragraph clinical summary with key terms wrapped in <b>tags</b> and specific guideline citations for key decisions",
-  "recommend": "one actionable sentence",
+  "verdict": "short verdict phrase — no dollar amounts",
+  "narrative": "one paragraph clinical summary with key terms in <b>tags</b> and guideline citations — no dollar amounts or payment figures",
+  "recommend": "one actionable sentence — no dollar amounts",
   "guidelines_applied": ["list of all guidelines cited in this review"]
 }
 
 Follow this step sequence: (1) principal diagnosis validation, (2) Sepsis-3 criteria assessment, (3) one step per coded MCC or CC — validate each against the record, (4) DRG re-grouping determination, (5) documentation sufficiency assessment.`;
 
 function buildPrompt(c, record) {
-  const rw = { "871": 1.9425, "872": 1.0400 };
-  const base = 7000;
-  const pay = rw[c.drgBilled] ? Math.round(rw[c.drgBilled] * base) : 'unknown';
   return `CLAIM — ${c.name} (${c.demo})
 Billed DRG: ${c.drgBilled} — ${c.drgBilledDesc}
-Expected payment: $${pay.toLocaleString()} (RW ${rw[c.drgBilled]} × $${base} base rate)
 
 Coded diagnoses:
 ${c.claim.map(d => '  ' + d.code + ' — ' + d.desc + ' [' + d.role + ']').join('\n')}
@@ -51,7 +54,7 @@ ${c.claim.map(d => '  ' + d.code + ' — ' + d.desc + ' [' + d.role + ']').join(
 MEDICAL RECORD:
 ${record}
 
-Validate whether the billed DRG is clinically supported by the documentation. If any MCC or CC is unsupported, determine the correct DRG and financial impact.`;
+Validate whether the billed DRG is clinically supported by the documentation. If any MCC or CC is unsupported, determine the correct DRG. Do not include any dollar amounts or payment figures in your response.`;
 }
 
 module.exports = async function handler(req, res) {
@@ -100,6 +103,23 @@ module.exports = async function handler(req, res) {
       console.error('JSON parse error:', parseErr.message, 'Raw:', raw.substring(0, 500));
       return res.status(502).json({ error: 'Failed to parse AI response', raw: raw.substring(0, 300) });
     }
+
+    // Attach verified payment figures from our rate table — not from Claude
+    const billedPay = payFor(caseData.drgBilled);
+    const finalPay = parsed.disposition === 'pend' ? null : payFor(parsed.drgFinal);
+    const swing = billedPay && finalPay ? billedPay - finalPay : (billedPay ? billedPay - payFor('872') : null);
+
+    parsed._payment = {
+      billedDrg: caseData.drgBilled,
+      billedPay,
+      finalDrg: parsed.drgFinal,
+      finalPay,
+      impact: parsed.disposition === 'validate' ? 0 : swing,
+      impactType: parsed.disposition === 'validate' ? 'zero' : parsed.disposition === 'pend' ? 'risk' : 'pos',
+      rw871: RATE.rw['871'],
+      rw872: RATE.rw['872'],
+      base: RATE.base
+    };
 
     res.status(200).json(parsed);
   } catch (err) {
